@@ -1,58 +1,74 @@
 import {
   ExecutionContext,
   ForwardableEmailMessage,
-  HTMLRewriter,
   HTMLRewriterElementContentHandlers,
-  Response,
   Text
 } from "@cloudflare/workers-types"
+
+import type {HTMLRewriter, Response} from "@cloudflare/workers-types"
 
 async function parseChaseEmail(email: ForwardableEmailMessage):
     Promise<Entry|undefined> {
   class ChaseEmailParser implements HTMLRewriterElementContentHandlers {
-    last_message: string = "";
 
     amount: number|undefined = undefined;
     account: string|undefined = undefined;
     date: Date|undefined = undefined;
     description: string|undefined = undefined;
 
-    handleNewText(text: string) {
-      const tx = text.trim();
-      if (tx === "")
+    handleNewText(header: string, content: string) {
+      if ("" in [header, content])
         return;
 
-      switch (tx) {
+      switch (header) {
       case "Account ending in": {
-        const match = tx.match(/\(\.\.\.(\d{4})\)/);
+        console.debug("Processing Account: ", content);
+        // Match (...1234)
+        const match = content.match(/\(\.\.\.(\d{4})\)/);
         if (match && (match.length > 1))
           this.account = match[1];
         break;
       }
       case "Made on": {
-        this.date = new Date(Date.parse(tx));
+        console.debug("Processing date: ", content);
+        // Match: e.g. Jul 15, 2024 at 7:02 PM ET
+        const regex =
+            /\b([A-Za-z]{3}) (\d{1,2}), (\d{4}) at (\d{1,2}):(\d{2}) (AM|PM) ([A-Za-z]{2,4})\b/;
+        const match = content.match(regex);
+        if (match) {
+          const dateTime = match[0];
+          // Match: e.g. Jul 15
+          const date = dateTime.substring(0, dateTime.indexOf("at"));
+          this.date = new Date(Date.parse(date));
+        }
         break;
       }
       case "Description": {
-        this.description = tx;
+        console.debug("Processing description: ", content);
+        this.description = content;
         break;
       }
       case "Amount": {
-        const match = tx.match(/\$?(\d+\.\d{2})/);
+        console.debug("Processing amount: ", content);
+        // Match $23.45
+        const match = content.match(/\$?(\d+\.\d{2})/);
         if (match && (match.length > 1))
           this.amount = parseFloat(match[1]);
         break;
       }
       }
-
-      this.last_message = tx;
     }
 
+    last_message: string = "";
     working_text = "";
     text(text: Text) {
       this.working_text = this.working_text.concat(text.text);
+      this.working_text = this.working_text.trim();
+
       if (text.lastInTextNode) {
-        this.handleNewText(this.working_text);
+        this.handleNewText(this.last_message, this.working_text);
+
+        this.last_message = this.working_text;
         this.working_text = "";
       }
     }
