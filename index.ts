@@ -9,65 +9,73 @@ import {
 
 async function parseChaseEmail(email: ForwardableEmailMessage):
     Promise<Entry|undefined> {
-
-  const subject = email.headers.get("subject");
-  if (!subject)
-    return undefined;
-
-  const matchSubject = (pattern: RegExp) => subject?.match(pattern)?.[1];
-
-  const amount = matchSubject(/\$([0-9]+\.[0-9]{2})/);
-  const account = matchSubject(/\(…([0-9]{4})\)/);
-
-  if (!amount || !account)
-    return undefined;
-
-  var date: Date = new Date();
-  var description = "";
-
   class ChaseEmailParser implements HTMLRewriterElementContentHandlers {
     last_message: string = "";
 
-    amount: Number|undefined = undefined;
+    amount: number|undefined = undefined;
     account: string|undefined = undefined;
     date: Date|undefined = undefined;
     description: string|undefined = undefined;
 
-    text(text: Text) {
-      const tx = text.text.trim();
+    handleNewText(text: string) {
+      const tx = text.trim();
       if (tx === "")
         return;
 
       switch (tx) {
       case "Account ending in": {
+        const match = tx.match(/\(\.\.\.(\d{4})\)/);
+        if (match && (match.length > 1))
+          this.account = match[1];
         break;
       }
       case "Made on": {
-        date = new Date(Date.parse(tx));
+        this.date = new Date(Date.parse(tx));
         break;
       }
       case "Description": {
-        description = tx;
+        this.description = tx;
         break;
       }
       case "Amount": {
+        const match = tx.match(/\$?(\d+\.\d{2})/);
+        if (match && (match.length > 1))
+          this.amount = parseFloat(match[1]);
         break;
       }
       }
 
       this.last_message = tx;
     }
+
+    working_text = "";
+    text(text: Text) {
+      this.working_text = this.working_text.concat(text.text);
+      if (text.lastInTextNode) {
+        this.handleNewText(this.working_text);
+        this.working_text = "";
+      }
+    }
+
+    result(): Entry|undefined {
+      if (this.amount && this.account && this.date && this.description) {
+        return {
+          amount: this.amount, title: this.description, account: this.account,
+              postedDate: this.date
+        }
+      } else {
+        return undefined;
+      }
+    }
   }
 
+  const parser = new ChaseEmailParser();
   await new HTMLRewriter()
-      .on("td", new ChaseEmailParser())
+      .on("td", parser)
       .transform(new Response(email.raw))
       .arrayBuffer();
 
-  return {
-    amount: Number(amount), title: description, account: account,
-        postedDate: date
-  }
+  return parser.result();
 }
 
 interface Entry {
@@ -78,6 +86,14 @@ interface Entry {
 }
 
 export default {
-  async email(message: ForwardableEmailMessage, _env: {},
-              _ctx: ExecutionContext) { const content = parseChaseEmail(email);}
+  async email(email: ForwardableEmailMessage, _env: {},
+              _ctx: ExecutionContext) {
+    const content = await parseChaseEmail(email);
+    if (!content) {
+      console.warn(`Cannot process email from ${email.from} to ${email.to}`);
+      email.setReject("Cannot process");
+    } else {
+      console.debug(`Parsed email: from ${email.from} to ${email.to}`, content);
+    }
+  }
 }
