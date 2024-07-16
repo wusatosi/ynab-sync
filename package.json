@@ -9,7 +9,8 @@
   "author": "",
   "license": "GPL-3.0-only",
   "dependencies": {
-    "typescript": "^5.5.3"
+    "typescript": "^5.5.3",
+    "wrangler": "^3.65.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240712.0"
