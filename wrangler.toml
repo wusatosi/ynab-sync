@@ -1,3 +1,9 @@
 name = "ynab-sync"
+main = "index.ts"
 compatibility_date = "2024-07-16"
+
+kv_namespaces = [
+  { binding = "YS_CONFIG", id = "bb3e855bd3bf42fc98993580c170592e" }
+]
+
 

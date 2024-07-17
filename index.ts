@@ -2,6 +2,7 @@ import {
   ExecutionContext,
   ForwardableEmailMessage,
   HTMLRewriterElementContentHandlers,
+  KVNamespace,
   Text
 } from "@cloudflare/workers-types";
 
@@ -25,7 +26,7 @@ async function parseChaseEmail(email: ForwardableEmailMessage):
       switch (header) {
       case "Account ending in": {
         console.debug("Processing Account: ", content);
-        // Match (...1234)
+        // Match (...1234) => 1234
         const match = content.match(/\(\.\.\.(\d{4})\)/);
         if (match && (match.length > 1))
           this.account = match[1];
@@ -66,10 +67,13 @@ async function parseChaseEmail(email: ForwardableEmailMessage):
     last_message: string = "";
     working_text = "";
     text(text: Text) {
-      this.working_text = this.working_text.concat(text.text);
-      this.working_text = this.working_text.trim();
-
+      this.working_text = this.working_text.concat(text.text).trim();
       if (text.lastInTextNode) {
+        // This is to exclude any open tags passed in
+        // The debugging email server somehow inserts =\r\n in random places
+        this.working_text =
+            this.working_text.replace(/<=[\s\S]*?>/g, "").replace("=\r\n", "");
+
         this.handleNewText(this.last_message, this.working_text);
 
         this.last_message = this.working_text;
@@ -84,6 +88,9 @@ async function parseChaseEmail(email: ForwardableEmailMessage):
               postedDate: this.date
         }
       } else {
+        console.log(
+            `Email parsing failed with: account: ${this.account}, title: ${
+                this.description}, amount: ${this.amount}, date: ${this.date}`);
         return undefined;
       }
     }
@@ -105,35 +112,54 @@ interface Entry {
   postedDate: Date;
 }
 
-async function createYNABTransaction(entry: Entry, env: WorkerEnv) {
+async function createYNABTransaction(entry: Entry, account: UserAccount,
+                                     env: WorkerEnv) {
   const memo = "Auto import through email alert via ynab-sync.";
   const importId =
-      `email-sync:v0:${entry.amount}:${entry.postedDate.getUTCSeconds()}`;
-  console.log("importID:", importId);
+      `email-sync:b0:${entry.amount}:${new Date().getUTCSeconds()}`;
 
   const api = new API(env.YNAB_KEY);
   try {
-    const res = await api.transactions.createTransaction(
-        "33aacae5-88ae-4178-9534-99840d8f2cea", {
-          transaction : {
-            account_id : "98fec45b-fc65-4477-a2c9-3811d6e314c9",
-            date : entry.postedDate.toISOString(),
-            amount : entry.amount,
-            payee_name : entry.title,
-            memo : memo,
-            cleared : "uncleared",
-            approved : false,
-            import_id : importId
-          }
-        });
+    const res = await api.transactions.createTransaction(account.budgetId, {
+      transaction : {
+        account_id : account.accountId,
+        date : entry.postedDate.toISOString(),
+        amount : entry.amount,
+        payee_name : entry.title,
+        memo : memo,
+        cleared : "uncleared",
+        approved : false,
+        import_id : importId
+      }
+    });
     console.log("Response from ynab:", res);
   } catch (e) {
-    console.warn(e);
+    console.warn("YNAB failed with exception:", e);
+  }
+}
+
+interface UserAccount {
+  budgetId: string;
+  accountId: string;
+  forwardAddress: string|null;
+}
+
+async function getUserAccount(userTag: string, bankAccount: string,
+                              env: WorkerEnv): Promise<UserAccount|null> {
+  const key = `${userTag}/${bankAccount}`;
+  const store = await env.YS_CONFIG.get(key);
+  if (!store)
+    return null;
+  try {
+    return JSON.parse(store);
+  } catch (e) {
+    console.warn("Malformed data in storage, key:", key, " got: ", store, e);
+    throw e;
   }
 }
 
 async function handleYNABSync(email: ForwardableEmailMessage, env: WorkerEnv) {
-  console.debug(`Handle email: from ${email.from} to ${email.to}`);
+  const userTag = parseEmailAddress(email.to).tag;
 
   const content = await parseChaseEmail(email);
   if (!content) {
@@ -142,11 +168,27 @@ async function handleYNABSync(email: ForwardableEmailMessage, env: WorkerEnv) {
     return;
   }
   console.debug(`Parsed object:`, content);
-  await createYNABTransaction(content, env);
+
+  const ynabInfo = await getUserAccount(userTag, content.account, env);
+  if (!ynabInfo) {
+    console.warn(
+        `User with tag: ${userTag} and account ${content.account} not found`);
+    email.setReject("Non-acceptable Address");
+    return;
+  }
+
+  await createYNABTransaction(content, ynabInfo, env);
+
+  if (ynabInfo.forwardAddress) {
+    console.debug("Forward to email address as configured",
+                  ynabInfo.forwardAddress);
+    await email.forward(ynabInfo.forwardAddress);
+  }
 }
 
 interface WorkerEnv {
   YNAB_KEY: string;
+  YS_CONFIG: KVNamespace;
 }
 
 function parseEmailAddress(addr: string): EmailAddress {
