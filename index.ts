@@ -1,16 +1,20 @@
 import {
   ExecutionContext,
   ForwardableEmailMessage,
+  Headers,
   HTMLRewriterElementContentHandlers,
   KVNamespace,
+  R2Bucket,
   Text
 } from "@cloudflare/workers-types";
 
-import type {HTMLRewriter, Response} from "@cloudflare/workers-types";
+import type {
+  HTMLRewriter, Response, FixedLengthStream, ReadableStream} from
+  "@cloudflare/workers-types";
 
 import {API} from "ynab";
 
-async function parseChaseEmail(email: ForwardableEmailMessage):
+async function parseChaseEmail(emailBody: ReadableStream<Uint8Array>):
     Promise<Entry|undefined> {
   class ChaseEmailParser implements HTMLRewriterElementContentHandlers {
 
@@ -99,7 +103,7 @@ async function parseChaseEmail(email: ForwardableEmailMessage):
   const parser = new ChaseEmailParser();
   await new HTMLRewriter()
       .on("td", parser)
-      .transform(new Response(email.raw))
+      .transform(new Response(emailBody))
       .arrayBuffer();
 
   return parser.result();
@@ -158,10 +162,12 @@ async function getUserAccount(userTag: string, bankAccount: string,
   }
 }
 
-async function handleYNABSync(email: ForwardableEmailMessage, env: WorkerEnv) {
+async function handleYNABSync(email: ForwardableEmailMessage,
+                              body: ReadableStream<Uint8Array>,
+                              env: WorkerEnv) {
   const userTag = parseEmailAddress(email.to).tag;
 
-  const content = await parseChaseEmail(email);
+  const content = await parseChaseEmail(body);
   if (!content) {
     console.warn(`Cannot process email from ${email.from} to ${email.to}`);
     email.setReject("Cannot parse email for sync");
@@ -186,9 +192,10 @@ async function handleYNABSync(email: ForwardableEmailMessage, env: WorkerEnv) {
   }
 }
 
-interface WorkerEnv {
-  YNAB_KEY: string;
-  YS_CONFIG: KVNamespace;
+interface EmailAddress {
+  username: string;
+  tag: string;
+  domain: string;
 }
 
 function parseEmailAddress(addr: string): EmailAddress {
@@ -208,10 +215,23 @@ function parseEmailAddress(addr: string): EmailAddress {
   return {username : username, tag : tag, domain : domain};
 }
 
-interface EmailAddress {
-  username: string;
-  tag: string;
-  domain: string;
+async function uploadEmailToR2(email: ForwardableEmailMessage,
+                               emailBody: ReadableStream<Uint8Array>,
+                               bucket: R2Bucket) {
+  const addr = parseEmailAddress(email.to);
+  const key = `${addr.username}/${addr.tag}/${email.from}/${
+      email.headers.get("Message-ID")}`;
+  console.debug("Uploading email as", key);
+  const stream = new FixedLengthStream(email.rawSize);
+  emailBody.pipeTo(stream.writable);
+  const r2res = await bucket.put(key, stream.readable);
+  console.debug("Email uploaded successfully");
+}
+
+interface WorkerEnv {
+  YNAB_KEY: string;
+  YS_CONFIG: KVNamespace;
+  YS_EMAIL_STORAGE: R2Bucket;
 }
 
 export default {
@@ -221,7 +241,15 @@ export default {
 
     const addr = parseEmailAddress(email.to);
     console.debug("Parsed email address as:", addr);
-    if (addr.username === "ingest")
-      await handleYNABSync(email, env);
+
+    if (addr.username === "ingest") {
+      const [copyStream, ynabStream] = email.raw.tee();
+      await Promise.all([
+        uploadEmailToR2(email, copyStream, env.YS_EMAIL_STORAGE),
+        handleYNABSync(email, ynabStream, env)
+      ]);
+    } else {
+      await uploadEmailToR2(email, email.raw, env.YS_EMAIL_STORAGE);
+    }
   }
 }

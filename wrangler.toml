@@ -6,4 +6,8 @@ kv_namespaces = [
   { binding = "YS_CONFIG", id = "bb3e855bd3bf42fc98993580c170592e" }
 ]
 
+r2_buckets = [
+  { binding = "YS_EMAIL_STORAGE", bucket_name = "ynab-sync-emails-v0" }
+]
+
 
