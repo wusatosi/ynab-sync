@@ -4,7 +4,7 @@
   "description": "A YNAB sync tool",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "deploy": "wrangler deploy"
   },
   "author": "",
   "license": "GPL-3.0-only",
