@@ -9,7 +9,8 @@ import {
 } from "@cloudflare/workers-types";
 
 import type {
-  FixedLengthStream, HTMLRewriter, Response} from "@cloudflare/workers-types"
+  FixedLengthStream, HTMLRewriter, Response, Request} from
+  "@cloudflare/workers-types"
 
 import {API} from "ynab";
 
@@ -287,5 +288,12 @@ export default {
     } else {
       await uploadEmailToR2(email, email.raw, env.YS_EMAIL_STORAGE);
     }
-  }
+  },
+  async fetch(
+      _request: Request,
+      _env: WorkerEnv,
+      _ctx: ExecutionContext,
+      ):
+      Promise<Response> { return Response.redirect("https://www.example.com/"));
+      }
 }
