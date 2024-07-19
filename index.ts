@@ -71,6 +71,7 @@ async function parseBOAEmail(emailBody: ReadableStream<Uint8Array>):
     Promise<Entry|undefined> {
   class BOAEmailParser extends GenericStringParser {
     completeTextChunk(chunk: string) {
+      console.debug("Accepting new chunk", chunk);
       {
         // Match $5.72 => 5.72
         const match = chunk.match(/\$?(\d+\.\d{2})/);
@@ -78,6 +79,7 @@ async function parseBOAEmail(emailBody: ReadableStream<Uint8Array>):
           // milliunits format => -572
           // Note: rounding for floating point
           this.amount = Math.round(parseFloat(match[1]) * -1000);
+          console.debug("Set amount", this.amount);
           return;
         }
       }
@@ -86,6 +88,7 @@ async function parseBOAEmail(emailBody: ReadableStream<Uint8Array>):
         const match = chunk.match(/ending in (\d{4})/);
         if (match && (match.length > 1)) {
           this.account = match[1];
+          console.debug("Set account", this.account);
           return;
         }
       }
@@ -94,12 +97,14 @@ async function parseBOAEmail(emailBody: ReadableStream<Uint8Array>):
         const dateNum = Date.parse(chunk);
         if (dateNum && dateNum != Number.NaN) {
           this.date = new Date(dateNum);
+          console.debug("Set date", this.date);
           return;
         }
       }
       {
         if (!this.description) {
           this.description = chunk;
+          console.debug("Set description", this.description);
           return;
         }
       }
@@ -280,7 +285,7 @@ async function handleYNABSync(email: ForwardableEmailMessage,
                               body: ReadableStream<Uint8Array>,
                               env: WorkerEnv) {
   const emailMeta = parseEmailAddress(email.to)
-  const userTag = emailMeta.tag;
+  const userTag = emailMeta.username;
 
   const authInfo = await getUserInfo(userTag, env);
   if (!authInfo) {
@@ -295,6 +300,10 @@ async function handleYNABSync(email: ForwardableEmailMessage,
     content = await parseChaseEmail(body);
   } else if (domain.endsWith("bankofamerica.com")) {
     content = await parseBOAEmail(body);
+  } else {
+    console.log("Received from a non-whitelisted domain", domain);
+    email.setReject("Non-Acceptable Origin");
+    return;
   }
 
   if (!content) {
@@ -311,7 +320,9 @@ async function handleYNABSync(email: ForwardableEmailMessage,
   if (!ynabInfo) {
     console.warn(
         `User with tag: ${userTag} and account ${content.account} not found`);
-    email.setReject("Non-acceptable Address");
+    // TODO: maybe I should block these...
+    // email.setReject("Non-acceptable Address");
+    await email.forward(authInfo.email);
     return;
   }
 
@@ -349,9 +360,7 @@ function parseEmailAddress(addr: string): EmailAddress {
 async function uploadEmailToR2(email: ForwardableEmailMessage,
                                emailBody: ReadableStream<Uint8Array>,
                                bucket: R2Bucket) {
-  const addr = parseEmailAddress(email.to);
-  const key = `${addr.username}/${addr.tag}/${email.from}/${
-      email.headers.get("Message-ID")}`;
+  const key = `${email.to}/${email.from}/${email.headers.get("Message-ID")}`;
   console.debug("Uploading email as", key);
   const stream = new FixedLengthStream(email.rawSize);
   emailBody.pipeTo(stream.writable);
@@ -373,16 +382,17 @@ export default {
     const addr = parseEmailAddress(email.to);
     console.debug("Parsed email address as:", addr);
 
-    if (addr.username === "ingest") {
+    if (addr.domain === "s.kcibald.com") {
       const [copyStream, ynabStream] = email.raw.tee();
       await Promise.all([
         uploadEmailToR2(email, copyStream, env.YS_EMAIL_STORAGE),
         handleYNABSync(email, ynabStream, env)
       ]);
-    } else if (addr.username === "bounce") {
-      await email.forward(env.BOUNCE_ADDRESS);
     } else {
-      await uploadEmailToR2(email, email.raw, env.YS_EMAIL_STORAGE);
+      await Promise.all([
+        // uploadEmailToR2(email, email.raw, env.YS_EMAIL_STORAGE),
+        email.forward(env.BOUNCE_ADDRESS)
+      ]);
     }
   },
   async fetch(
