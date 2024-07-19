@@ -14,26 +14,105 @@ import type {
 
 import {API} from "ynab";
 
-abstract class GenericStringPairParser implements
-    HTMLRewriterElementContentHandlers {
-  abstract handleNewText(header: string, content: string): void;
+abstract class EmailParser {
+  amount: number|undefined = undefined;
+  date: Date|undefined = undefined;
+  description: string|undefined = undefined;
+  account: string|undefined = undefined;
 
-  last_message: string = "";
-  working_text = "";
+  result(): Entry|undefined {
+    const result = {
+      amount : this.amount,
+      title : this.description,
+      account : this.account,
+      postedDate : this.date
+    };
+
+    if (this.amount && this.account && this.date && this.description) {
+      return result as Entry;
+    } else {
+      console.log("Email parsing failed", result);
+      return undefined;
+    }
+  }
+}
+
+abstract class GenericStringParser extends EmailParser implements
+    HTMLRewriterElementContentHandlers {
+
+  abstract completeTextChunk(chunk: string): void;
+
+  private working_text = "";
   text(text: Text) {
-    this.working_text = this.working_text.concat(text.text).trim();
+    this.working_text = this.working_text.concat(text.text);
     if (text.lastInTextNode) {
       // This is to exclude any open tags passed in
       // The debugging email server somehow inserts =\r\n in random places
-      this.working_text =
-          this.working_text.replace(/<=[\s\S]*?>/g, "").replace("=\r\n", "");
-
-      this.handleNewText(this.last_message, this.working_text);
-
-      this.last_message = this.working_text;
+      this.working_text = this.working_text.replaceAll("=\r\n", "")
+                              .replaceAll(/<=[\s\S]*?>/g, "")
+                              .trim();
+      this.completeTextChunk(this.working_text);
       this.working_text = "";
     }
   }
+}
+
+abstract class GenericStringPairParser extends GenericStringParser {
+  abstract completeTextPair(header: string, content: string): void;
+
+  private last_message: string = "";
+  completeTextChunk(chunk: string): void {
+    this.completeTextPair(this.last_message, chunk);
+    this.last_message = chunk;
+  }
+}
+
+async function parseBOAEmail(emailBody: ReadableStream<Uint8Array>):
+    Promise<Entry|undefined> {
+  class BOAEmailParser extends GenericStringParser {
+    completeTextChunk(chunk: string) {
+      {
+        // Match $5.72 => 5.72
+        const match = chunk.match(/\$?(\d+\.\d{2})/);
+        if (match && (match.length > 1)) {
+          // milliunits format => -572
+          // Note: rounding for floating point
+          this.amount = Math.round(parseFloat(match[1]) * -1000);
+          return;
+        }
+      }
+      {
+        // Match ending in xxxx
+        const match = chunk.match(/ending in (\d{4})/);
+        if (match && (match.length > 1)) {
+          this.account = match[1];
+          return;
+        }
+      }
+      {
+        // Match July 19, 2024
+        const dateNum = Date.parse(chunk);
+        if (dateNum && dateNum != Number.NaN) {
+          this.date = new Date(dateNum);
+          return;
+        }
+      }
+      {
+        if (!this.description) {
+          this.description = chunk;
+          return;
+        }
+      }
+    }
+  }
+
+  const parser = new BOAEmailParser();
+  await new HTMLRewriter()
+      .on("b", parser)
+      .transform(new Response(emailBody))
+      .arrayBuffer();
+
+  return parser.result();
 }
 
 async function parseChaseEmail(emailBody: ReadableStream<Uint8Array>):
@@ -45,7 +124,7 @@ async function parseChaseEmail(emailBody: ReadableStream<Uint8Array>):
     date: Date|undefined = undefined;
     description: string|undefined = undefined;
 
-    handleNewText(header: string, content: string) {
+    completeTextPair(header: string, content: string) {
       if ("" in [header, content])
         return;
 
@@ -187,12 +266,21 @@ async function getUserAccount(userTag: string, bankAccount: string,
   }
 }
 
+function extractDomain(fromAddress: string) {
+  const meta = parseEmailAddress(fromAddress);
+  // This is for testing
+  if (meta.domain === "wusatosi.com") {
+    return meta.tag;
+  } else {
+    return meta.domain;
+  }
+}
+
 async function handleYNABSync(email: ForwardableEmailMessage,
                               body: ReadableStream<Uint8Array>,
                               env: WorkerEnv) {
   const emailMeta = parseEmailAddress(email.to)
   const userTag = emailMeta.tag;
-  const domain = emailMeta.domain;
 
   const authInfo = await getUserInfo(userTag, env);
   if (!authInfo) {
@@ -201,10 +289,13 @@ async function handleYNABSync(email: ForwardableEmailMessage,
     return;
   }
 
+  const domain = extractDomain(email.from);
   let content: Entry|undefined = undefined;
-  // if (domain.endsWith("chase.com")) {
-  content = await parseChaseEmail(body);
-  // }
+  if (domain.endsWith("chase.com")) {
+    content = await parseChaseEmail(body);
+  } else if (domain.endsWith("bankofamerica.com")) {
+    content = await parseBOAEmail(body);
+  }
 
   if (!content) {
     console.log(
@@ -299,6 +390,5 @@ export default {
       _env: WorkerEnv,
       _ctx: ExecutionContext,
       ):
-      Promise<Response> { return Response.redirect("https://www.example.com/"));
-      }
+      Promise<Response> { return Response.redirect("https://www.example.com/");}
 }
