@@ -14,9 +14,31 @@ import type {
 
 import {API} from "ynab";
 
+abstract class GenericStringPairParser implements
+    HTMLRewriterElementContentHandlers {
+  abstract handleNewText(header: string, content: string): void;
+
+  last_message: string = "";
+  working_text = "";
+  text(text: Text) {
+    this.working_text = this.working_text.concat(text.text).trim();
+    if (text.lastInTextNode) {
+      // This is to exclude any open tags passed in
+      // The debugging email server somehow inserts =\r\n in random places
+      this.working_text =
+          this.working_text.replace(/<=[\s\S]*?>/g, "").replace("=\r\n", "");
+
+      this.handleNewText(this.last_message, this.working_text);
+
+      this.last_message = this.working_text;
+      this.working_text = "";
+    }
+  }
+}
+
 async function parseChaseEmail(emailBody: ReadableStream<Uint8Array>):
     Promise<Entry|undefined> {
-  class ChaseEmailParser implements HTMLRewriterElementContentHandlers {
+  class ChaseEmailParser extends GenericStringPairParser {
 
     amount: number|undefined = undefined;
     account: string|undefined = undefined;
@@ -65,23 +87,6 @@ async function parseChaseEmail(emailBody: ReadableStream<Uint8Array>):
           this.amount = Math.round(parseFloat(match[1]) * -1000);
         break;
       }
-      }
-    }
-
-    last_message: string = "";
-    working_text = "";
-    text(text: Text) {
-      this.working_text = this.working_text.concat(text.text).trim();
-      if (text.lastInTextNode) {
-        // This is to exclude any open tags passed in
-        // The debugging email server somehow inserts =\r\n in random places
-        this.working_text =
-            this.working_text.replace(/<=[\s\S]*?>/g, "").replace("=\r\n", "");
-
-        this.handleNewText(this.last_message, this.working_text);
-
-        this.last_message = this.working_text;
-        this.working_text = "";
       }
     }
 
