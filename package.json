@@ -9,6 +9,7 @@
   "author": "",
   "license": "GPL-3.0-only",
   "dependencies": {
+    "postal-mime": "^2.2.6",
     "typescript": "^5.5.3",
     "wrangler": "^3.65.0",
     "ynab": "^2.4.0"

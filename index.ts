@@ -1,6 +1,7 @@
 import {
   ExecutionContext,
   ForwardableEmailMessage,
+  Headers,
   HTMLRewriterElementContentHandlers,
   KVNamespace,
   R2Bucket,
@@ -13,6 +14,9 @@ import type {
   "@cloudflare/workers-types"
 
 import {API} from "ynab";
+
+import PostalMime, {Header} from "postal-mime";
+import type {RawEmail, Email} from "postal-mime";
 
 abstract class EmailParser {
   amount: number|undefined = undefined;
@@ -67,8 +71,7 @@ abstract class GenericStringPairParser extends GenericStringParser {
   }
 }
 
-async function parseBOAEmail(emailBody: ReadableStream<Uint8Array>):
-    Promise<Entry|undefined> {
+async function parseBOAEmail(email: CompoundEmail): Promise<Entry|undefined> {
   class BOAEmailParser extends GenericStringParser {
     completeTextChunk(chunk: string) {
       console.debug("Accepting new chunk", chunk);
@@ -111,6 +114,10 @@ async function parseBOAEmail(emailBody: ReadableStream<Uint8Array>):
     }
   }
 
+  const emailBody = email.html();
+  if (emailBody === undefined)
+    return undefined;
+
   const parser = new BOAEmailParser();
   await new HTMLRewriter()
       .on("b", parser)
@@ -120,15 +127,8 @@ async function parseBOAEmail(emailBody: ReadableStream<Uint8Array>):
   return parser.result();
 }
 
-async function parseChaseEmail(emailBody: ReadableStream<Uint8Array>):
-    Promise<Entry|undefined> {
+async function parseChaseEmail(email: CompoundEmail): Promise<Entry|undefined> {
   class ChaseEmailParser extends GenericStringPairParser {
-
-    amount: number|undefined = undefined;
-    account: string|undefined = undefined;
-    date: Date|undefined = undefined;
-    description: string|undefined = undefined;
-
     completeTextPair(header: string, content: string) {
       if ("" in [header, content])
         return;
@@ -173,23 +173,11 @@ async function parseChaseEmail(emailBody: ReadableStream<Uint8Array>):
       }
       }
     }
-
-    result(): Entry|undefined {
-      const result = {
-        amount : this.amount,
-        title : this.description,
-        account : this.account,
-        postedDate : this.date
-      };
-
-      if (this.amount && this.account && this.date && this.description) {
-        return result as Entry;
-      } else {
-        console.log("Email parsing failed", result);
-        return undefined;
-      }
-    }
   }
+
+  const emailBody = email.html();
+  if (emailBody === undefined)
+    return undefined;
 
   const parser = new ChaseEmailParser();
   await new HTMLRewriter()
@@ -210,7 +198,9 @@ interface Entry {
 async function createYNABTransaction(accessToken: string, entry: Entry,
                                      account: UserAccount) {
   const memo = "Auto import through email alert via ynab-sync.";
-  const importId = `ys:b0:${entry.amount}:${new Date().getUTCSeconds()}`;
+  const isoString = entry.postedDate.toISOString();
+  const dateString = isoString.substring(0, isoString.indexOf("T"));
+  const importId = `ys:b0:${dateString}:${new Date().getUTCSeconds()}`;
 
   const api = new API(accessToken);
   try {
@@ -238,7 +228,7 @@ interface UserInfo {
 }
 
 async function getUserInfo(userTag: string,
-                           env: WorkerEnv): Promise<UserInfo|null> {
+                           env: YNABEnv): Promise<UserInfo|null> {
   const key = `${userTag}/auth`;
   const store = await env.YS_CONFIG.get(key);
   if (!store)
@@ -258,7 +248,7 @@ interface UserAccount {
 }
 
 async function getUserAccount(userTag: string, bankAccount: string,
-                              env: WorkerEnv): Promise<UserAccount|null> {
+                              env: YNABEnv): Promise<UserAccount|null> {
   const key = `${userTag}/${bankAccount}`;
   const store = await env.YS_CONFIG.get(key);
   if (!store)
@@ -281,9 +271,47 @@ function extractDomain(fromAddress: string) {
   }
 }
 
-async function handleYNABSync(email: ForwardableEmailMessage,
-                              body: ReadableStream<Uint8Array>,
-                              env: WorkerEnv) {
+class CompoundEmail {
+  private underlyingEmail: ForwardableEmailMessage;
+  private bodyStream: ReadableStream;
+  private parsedEmail!: Email;
+
+  private constructor(email: ForwardableEmailMessage, body: ReadableStream) {
+    this.headers = email.headers;
+    this.from = email.from;
+    this.to = email.to;
+
+    this.bodyStream = body;
+    this.rawSize = email.rawSize;
+
+    this.underlyingEmail = email;
+  }
+
+  static async create(email: ForwardableEmailMessage, body: ReadableStream) {
+    const e = new CompoundEmail(email, body);
+    e.parsedEmail = await PostalMime.parse(e.bodyStream as RawEmail);
+    return e;
+  }
+
+  readonly rawSize: number;
+
+  readonly headers: Headers;
+  readonly from: string;
+  readonly to: string;
+
+  setReject(reason: string ) {
+    this.underlyingEmail.setReject(reason);
+  }
+  async forward(rcptTo: string, header?:Headers|undefined) {
+    this.underlyingEmail.forward(rcptTo, header);
+  }
+
+  html(): string|undefined { return this.parsedEmail.html; }
+  messageId(): string { return this.parsedEmail.messageId; }
+  subject(): string { return this.parsedEmail.subject || ""; }
+};
+
+async function handleYNABSync(email: CompoundEmail, env: YNABEnv) {
   const emailMeta = parseEmailAddress(email.to)
   const userTag = emailMeta.username;
 
@@ -297,9 +325,9 @@ async function handleYNABSync(email: ForwardableEmailMessage,
   const domain = extractDomain(email.from);
   let content: Entry|undefined = undefined;
   if (domain.endsWith("chase.com")) {
-    content = await parseChaseEmail(body);
+    content = await parseChaseEmail(email);
   } else if (domain.endsWith("bankofamerica.com")) {
-    content = await parseBOAEmail(body);
+    content = await parseBOAEmail(email);
   } else {
     console.log("Received from a non-whitelisted domain", domain);
     email.setReject("Non-Acceptable Origin");
@@ -357,44 +385,80 @@ function parseEmailAddress(addr: string): EmailAddress {
   return {username : username, tag : tag, domain : domain};
 }
 
-async function uploadEmailToR2(email: ForwardableEmailMessage,
-                               emailBody: ReadableStream<Uint8Array>,
+async function uploadEmailToR2(email: CompoundEmail,
+                               rawEmail: ReadableStream<Uint8Array>,
                                bucket: R2Bucket) {
-  const key = `${email.to}/${email.from}/${email.headers.get("Message-ID")}`;
-  console.debug("Uploading email as", key);
-  const stream = new FixedLengthStream(email.rawSize);
-  emailBody.pipeTo(stream.writable);
-  await bucket.put(key, stream.readable);
-  console.debug("Email uploaded successfully");
+  const key = `${email.to}/${email.from}/${email.messageId()}`;
+
+  async function uploadRaw() {
+    const path = `${key}.eml`;
+    console.log("Uploading raw email as", path);
+    const stream = new FixedLengthStream(email.rawSize);
+    rawEmail.pipeTo(stream.writable);
+    await bucket.put(path, stream.readable, {
+      httpMetadata : {
+        contentType : "message/rfc822",
+        contentDisposition : `${email.subject()}.eml`
+      }
+    });
+    console.log("Raw Email uploaded successfully");
+  }
+
+  async function uploadHTML() {
+    const path = `${key}.html`;
+    console.log("Uploading html email as", path);
+
+    const html = email.html();
+    if (html === undefined) {
+      console.log("Email do not have html part, abort upload.");
+      return;
+    }
+
+    await bucket.put(path, html, {httpMetadata : {contentType : "text/html"}});
+    console.log("HTML Email uploaded successfully");
+  }
+
+  return Promise.all([ uploadRaw(), uploadHTML() ]);
 }
 
-interface WorkerEnv {
-  BOUNCE_ADDRESS: string;
+interface YNABEnv {
   YS_CONFIG: KVNamespace;
+}
+
+interface WorkerEnv extends YNABEnv {
+  BOUNCE_ADDRESS: string;
   YS_EMAIL_STORAGE: R2Bucket;
 }
 
 export default {
   async email(email: ForwardableEmailMessage, env: WorkerEnv,
               _ctx: ExecutionContext) {
-    console.debug(`Handle email: from ${email.from} to ${email.to}`);
+    console.debug("Handling email", {
+      from : email.from,
+      to : email.to,
+      subject : email.headers.get("Subject")
+    });
 
     const addr = parseEmailAddress(email.to);
     console.debug("Parsed email address as:", addr);
 
     if (addr.domain === "s.kcibald.com") {
+      console.log("Handling as YNAB sync");
       const [copyStream, ynabStream] = email.raw.tee();
+      const compoundEmail = await CompoundEmail.create(email, ynabStream);
       await Promise.all([
-        uploadEmailToR2(email, copyStream, env.YS_EMAIL_STORAGE),
-        handleYNABSync(email, ynabStream, env)
+        uploadEmailToR2(compoundEmail, copyStream, env.YS_EMAIL_STORAGE),
+        handleYNABSync(compoundEmail, env)
       ]);
     } else {
+      console.log("Forwarding...");
       await Promise.all([
         // uploadEmailToR2(email, email.raw, env.YS_EMAIL_STORAGE),
         email.forward(env.BOUNCE_ADDRESS)
       ]);
     }
   },
+
   async fetch(
       _request: Request,
       _env: WorkerEnv,
