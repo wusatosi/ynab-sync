@@ -15,7 +15,7 @@ import type {
 
 import {API} from "ynab";
 
-import PostalMime, {Header} from "postal-mime";
+import PostalMime  from "postal-mime";
 import type {RawEmail, Email} from "postal-mime";
 
 abstract class EmailParser {
@@ -428,11 +428,32 @@ interface YNABEnv {
 interface WorkerEnv extends YNABEnv {
   BOUNCE_ADDRESS: string;
   YS_EMAIL_STORAGE: R2Bucket;
+  YS_LOGS_STORAGE: R2Bucket;
+}
+
+class LoggingUploadService {
+  logs: string = "";
+  private hook: {detach: ()=>void}|undefined;
+
+  startLogging() {
+    const Hook = require('console-hook');
+    this.hook = Hook().attach((method: string, args: any[]) => {
+      this.logs = `${this.logs}\n[${method}] ${JSON.stringify(args)}`;
+    });
+  }
+
+  async finalizeLogging() {
+    this.hook?.detach();
+    console.log(this.logs);
+  }
 }
 
 export default {
   async email(email: ForwardableEmailMessage, env: WorkerEnv,
               _ctx: ExecutionContext) {
+    const lService = new LoggingUploadService();
+    lService.startLogging();
+
     console.debug("Handling email", {
       from : email.from,
       to : email.to,
@@ -457,6 +478,9 @@ export default {
         email.forward(env.BOUNCE_ADDRESS)
       ]);
     }
+
+    lService.finalizeLogging();
+    await env.YS_LOGS_STORAGE.put((new Date()).toISOString(), lService.logs);
   },
 
   async fetch(
