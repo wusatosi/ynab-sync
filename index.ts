@@ -311,57 +311,6 @@ class CompoundEmail {
   subject(): string { return this.parsedEmail.subject || ""; }
 };
 
-async function handleYNABSync(email: CompoundEmail, env: YNABEnv) {
-  const emailMeta = parseEmailAddress(email.to)
-  const userTag = emailMeta.username;
-
-  const authInfo = await getUserInfo(userTag, env);
-  if (!authInfo) {
-    console.warn(`User auth with tag: ${userTag} not found`);
-    email.setReject("Non-acceptable Address");
-    return;
-  }
-
-  const domain = extractDomain(email.from);
-  let content: Entry|undefined = undefined;
-  if (domain.endsWith("chase.com")) {
-    content = await parseChaseEmail(email);
-  } else if (domain.endsWith("bankofamerica.com")) {
-    content = await parseBOAEmail(email);
-  } else {
-    console.log("Received from a non-whitelisted domain", domain);
-    email.setReject("Non-Acceptable Origin");
-    return;
-  }
-
-  if (!content) {
-    console.log(
-        `Cannot process email from ${email.from} to ${email.to}, subject:`,
-        email.headers.get("Subject"));
-    await email.forward(authInfo.email);
-    return;
-  }
-
-  console.debug("Parsed object:", content);
-
-  const ynabInfo = await getUserAccount(userTag, content.account, env);
-  if (!ynabInfo) {
-    console.warn(
-        `User with tag: ${userTag} and account ${content.account} not found`);
-    // TODO: maybe I should block these...
-    // email.setReject("Non-acceptable Address");
-    await email.forward(authInfo.email);
-    return;
-  }
-
-  await createYNABTransaction(authInfo.accessToken, content, ynabInfo);
-
-  if (ynabInfo.forwardAddress) {
-    console.debug("Forward to email address as configured");
-    await email.forward(authInfo.email);
-  }
-}
-
 interface EmailAddress {
   username: string;
   tag: string;
@@ -423,37 +372,114 @@ async function uploadEmailToR2(email: CompoundEmail,
 
 interface YNABEnv {
   YS_CONFIG: KVNamespace;
-}
-
-interface WorkerEnv extends YNABEnv {
-  BOUNCE_ADDRESS: string;
   YS_EMAIL_STORAGE: R2Bucket;
   YS_LOGS_STORAGE: R2Bucket;
 }
 
-class LoggingUploadService {
+interface WorkerEnv extends YNABEnv {
+  BOUNCE_ADDRESS: string;
+}
+
+class LoggingHook {
   logs: string = "";
   private hook: {detach: ()=>void}|undefined;
 
-  startLogging() {
+  constructor() {
     const Hook = require('console-hook');
     this.hook = Hook().attach((method: string, args: any[]) => {
       this.logs = `${this.logs}\n[${method}] ${JSON.stringify(args)}`;
     });
   }
 
-  async finalizeLogging() {
+  async stopLogging() {
     this.hook?.detach();
     console.log(this.logs);
+  }
+}
+
+async function handleYNABSync(rawEmail: ForwardableEmailMessage, env: YNABEnv) {
+  const lService = new LoggingHook(); 
+  try {
+    // for logging service
+    console.debug("Handling ynab-sync email", {
+      from : rawEmail.from,
+      to : rawEmail.to,
+      subject : rawEmail.headers.get("Subject")
+    });
+
+    // Upload Email
+    const [copyStream, ynabStream] = rawEmail.raw.tee();
+    const email = await CompoundEmail.create(rawEmail, ynabStream);
+    const uploadEmailProm = 
+      uploadEmailToR2(email, copyStream, env.YS_EMAIL_STORAGE);
+
+    const userTag = parseEmailAddress(rawEmail.to).username;
+    const domain = extractDomain(rawEmail.from);
+  
+    // Grab user info
+    const authInfo = await getUserInfo(userTag, env);
+    if (!authInfo) {
+      console.warn(`User auth with tag: ${userTag} not found`);
+      rawEmail.setReject("Non-acceptable Address");
+      return;
+    }
+  
+    // Parse email
+    let content: Entry|undefined = undefined;
+    if (domain.endsWith("chase.com")) {
+      content = await parseChaseEmail(email);
+    } else if (domain.endsWith("bankofamerica.com")) {
+      content = await parseBOAEmail(email);
+    } else {
+      console.log("Received from a non-whitelisted domain", domain);
+      rawEmail.setReject("Non-Acceptable Origin");
+      return;
+    }
+    if (!content) {
+      console.log(
+          `Cannot process email from ${rawEmail.from} to ${rawEmail.to}, subject:`,
+          rawEmail.headers.get("Subject"));
+      await rawEmail.forward(authInfo.email);
+      return;
+    } else {
+      console.debug("Parsed object:", content);
+    }
+  
+    // Grab account info
+    const ynabInfo = await getUserAccount(userTag, content.account, env);
+    if (!ynabInfo) {
+      console.warn(
+          `User with tag: ${userTag} and account ${content.account} not found`);
+      // TODO: maybe I should block these...
+      // email.setReject("Non-acceptable Address");
+      await rawEmail.forward(authInfo.email);
+      return;
+    }
+  
+    // Post to ynab
+    await createYNABTransaction(authInfo.accessToken, content, ynabInfo);
+  
+    // Handle forwarding
+    if (ynabInfo.forwardAddress) {
+      console.debug("Forward to email address as configured");
+      await rawEmail.forward(authInfo.email);
+    }
+
+    // Wait till upload finish
+    await uploadEmailProm;
+  } finally {
+    lService.stopLogging();
+    await env.YS_LOGS_STORAGE.put(
+      (new Date()).toISOString(), 
+      lService.logs, 
+      { httpMetadata: { contentType: "text/plain" } }
+    );
   }
 }
 
 export default {
   async email(email: ForwardableEmailMessage, env: WorkerEnv,
               _ctx: ExecutionContext) {
-    const lService = new LoggingUploadService();
-    lService.startLogging();
-
     console.debug("Handling email", {
       from : email.from,
       to : email.to,
@@ -465,22 +491,11 @@ export default {
 
     if (addr.domain === "s.kcibald.com") {
       console.log("Handling as YNAB sync");
-      const [copyStream, ynabStream] = email.raw.tee();
-      const compoundEmail = await CompoundEmail.create(email, ynabStream);
-      await Promise.all([
-        uploadEmailToR2(compoundEmail, copyStream, env.YS_EMAIL_STORAGE),
-        handleYNABSync(compoundEmail, env)
-      ]);
+      await handleYNABSync(email, env);
     } else {
       console.log("Forwarding...");
-      await Promise.all([
-        // uploadEmailToR2(email, email.raw, env.YS_EMAIL_STORAGE),
-        email.forward(env.BOUNCE_ADDRESS)
-      ]);
+      await email.forward(env.BOUNCE_ADDRESS);
     }
-
-    lService.finalizeLogging();
-    await env.YS_LOGS_STORAGE.put((new Date()).toISOString(), lService.logs);
   },
 
   async fetch(
